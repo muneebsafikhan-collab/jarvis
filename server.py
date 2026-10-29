@@ -301,6 +301,27 @@ def quick_command(text):
     return None
 
 
+def guide_prompt(cfg):
+    now = datetime.now()
+    return (
+        "You are JARVIS, a patient, friendly teacher. You can SEE the user's computer screen in the attached screenshot. "
+        f"The user is {cfg.get('name') or 'the user'}. Local time: {now:%A %d %B %Y, %H:%M}. "
+        "You never click or type yourself: the user does every click and every keystroke. "
+        "Guide the user ONE small step at a time towards their goal: tell them exactly what to click or type, "
+        "describing where it is on the screen (top, left, the blue button, the search bar...). "
+        "Look at the newest screenshot to check whether the previous step is done. "
+        "If it is done, praise briefly (like 'Well done!') and give the next single step. "
+        "If it is not done yet, wait quietly. Only repeat the instruction if the user seems stuck or did something wrong, then gently correct them. "
+        "When the whole goal is finished, congratulate them and set goal_done to true. "
+        "Ignore the small JARVIS window in the corner of the screenshot. "
+        "Always answer in the SAME language the user speaks (Persian/Dari, English, Urdu, Pashto...). "
+        "Use 1-2 short spoken sentences, no markdown, no emojis. "
+        "Messages that start with [auto-check] are automatic screen checks, not the user talking: "
+        "for them, reply with an empty say unless the step was just completed, something went wrong, or the user seems stuck. "
+        'Reply with ONLY a JSON object: {"say": "what to say out loud", "goal_done": false}'
+    )
+
+
 def remember(text, say):
     history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": say}])
     del history[:-20]
@@ -458,6 +479,54 @@ def due_reminders():
     }
 
 
+# ---------------------------------------------------------------- JARVIS window (Windows)
+
+saved_rect = None
+
+
+def set_window_mode(mode):
+    """compact = small JARVIS window, always on top, bottom-right. normal = back to before."""
+    global saved_rect
+    if not IS_WINDOWS:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        n = user32.GetWindowTextLengthW(hwnd)
+        if n and user32.IsWindowVisible(hwnd):
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            if "J.A.R.V.I.S" in buf.value:
+                found.append(hwnd)
+        return True
+
+    user32.EnumWindows(each, 0)
+    if not found:
+        return False
+    hwnd = found[0]
+    HWND_TOPMOST, HWND_NOTOPMOST, SWP_SHOWWINDOW = -1, -2, 0x0040
+    user32.ShowWindow(hwnd, 9)  # restore if minimized/maximized
+    if mode == "compact":
+        r = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        if saved_rect is None:
+            saved_rect = (r.left, r.top, r.right - r.left, r.bottom - r.top)
+        work = wintypes.RECT()
+        user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0)  # work area (without taskbar)
+        w, h = 380, 470
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, work.right - w - 12, work.bottom - h - 12, w, h, SWP_SHOWWINDOW)
+    else:
+        x, y, w, h = saved_rect or (80, 60, 1400, 860)
+        user32.SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, w, h, SWP_SHOWWINDOW)
+        saved_rect = None
+    return True
+
+
 # ---------------------------------------------------------------- updates
 
 def local_version():
@@ -562,6 +631,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"system": system_status(), "reminders": due_reminders()})
         if path == "/api/update":
             return self._json(check_update())
+        if path == "/api/guide":
+            if self.headers.get("X-Jarvis") != "1":
+                return self._json({"error": "forbidden"}, 403)
+            cfg = get_config()
+            if not cfg.get("api_key"):
+                return self._json({"error": "no_key"})
+            return self._json({
+                "url": cfg["base_url"].rstrip("/") + "/chat/completions",
+                "key": cfg["api_key"],
+                "model": cfg["model"],
+                "backup": [m for m in PROVIDERS.get(cfg.get("provider"), {}).get("backup", []) if m != cfg["model"]],
+                "system": guide_prompt(cfg),
+            })
         if path == "/api/weather":
             return self._json(weather())
         if path == "/api/config":
@@ -613,6 +695,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": str(e)[:300]})
             restart_soon()
             return self._json({"ok": True, "changed": changed, "version": local_version()})
+        if path == "/api/window":
+            try:
+                return self._json({"ok": set_window_mode(str(data.get("mode", "normal")))})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:200]})
         if path == "/api/clear":
             history.clear()
             return self._json({"ok": True})

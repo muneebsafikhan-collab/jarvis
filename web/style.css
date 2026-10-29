@@ -185,3 +185,24 @@ details label { margin-top: 10px; }
 .ghost.go { background: var(--warn); color: #00121c; border-color: var(--warn); }
 .modal-box.center { justify-items: center; text-align: center; padding: 30px; }
 .spinner { width: 42px; height: 42px; border-radius: 50%; border: 3px solid var(--line2); border-top-color: var(--cyan); animation: spin 1s linear infinite; }
+
+/* screen guide */
+.screen-btn { margin-top: 16px; display: flex; align-items: center; gap: 10px; padding: 10px 18px; border-radius: 12px; border: 1px solid var(--line2); background: rgba(34,211,238,.08); color: var(--cyan2); font-family: var(--mono); font-size: 12px; letter-spacing: .15em; cursor: pointer; }
+.screen-btn:hover { background: rgba(34,211,238,.16); }
+body.sharing .screen-btn { background: rgba(244,63,94,.15); border-color: rgba(244,63,94,.5); color: #fecdd3; }
+.cform { display: none; gap: 6px; width: 100%; margin-top: 10px; }
+.cform input { flex: 1; padding: 8px 10px; font-size: 13px; }
+
+body.compact { overflow: hidden; }
+body.compact .topbar, body.compact .panel, body.compact .hint, body.compact .bg-grid { display: none; }
+body.compact .layout { display: block; height: 100vh; padding: 10px 14px; }
+body.compact .core { height: 100%; justify-content: flex-start; padding-top: 4px; }
+body.compact .orb-wrap { width: 150px; }
+body.compact .core-name { margin-top: 10px; font-size: 12px; }
+body.compact .heard { font-size: 14px; max-height: 96px; overflow-y: auto; margin-top: 6px; }
+body.compact .controls { margin-top: 10px; gap: 12px; }
+body.compact .mic { width: 52px; height: 52px; }
+body.compact .mic svg { width: 22px; height: 22px; }
+body.compact .ctl { padding: 6px 10px; font-size: 10px; }
+body.compact .screen-btn { margin-top: 10px; padding: 7px 12px; font-size: 10px; }
+body.compact .cform { display: flex; }

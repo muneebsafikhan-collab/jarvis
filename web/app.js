@@ -49,8 +49,8 @@
   }
 
   // ------------------------------------------------------------ server calls
-  async function api(path, body) {
-    const opts = body === undefined ? {} : {
+  async function api(path, body, withHeader) {
+    const opts = body === undefined ? (withHeader ? { headers: { "X-Jarvis": "1" } } : {}) : {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Jarvis": "1" },
       body: JSON.stringify(body),
@@ -124,6 +124,7 @@
   async function sendCommand(text) {
     text = (text || "").trim();
     if (!text || busy) return;
+    if (sharing) return guideTurn(text);
     busy = true;
     addMsg("user", text);
     $("heard").textContent = text;
@@ -573,6 +574,159 @@
     const typing = ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName);
     if (e.code === "Space" && !typing && !e.repeat) { e.preventDefault(); $("micBtn").click(); }
     if (e.key === "Escape") { $("modal").hidden = true; speechSynthesis.cancel(); }
+  });
+
+  // ------------------------------------------------------------ screen guide
+  let sharing = false, screenStream = null, guideCfg = null, guideHistory = [], goalActive = false;
+  let lastThumb = null, lastAskAt = 0, lastChangeAt = 0, pausedUntil = 0, watchTimer = null;
+  const video = document.createElement("video");
+  video.muted = true; video.playsInline = true;
+  const isFa = () => /^(fa|ur|ar|ps)/.test(config.language || "");
+
+  async function startScreen() {
+    try {
+      guideCfg = await api("/api/guide", undefined, true);
+    } catch (e) { guideCfg = null; }
+    if (!guideCfg || guideCfg.error) {
+      addMsg("bot", "Please add your AI key in Settings first."); openSettings(); return;
+    }
+    try {
+      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 2 }, audio: false });
+    } catch (e) {
+      addMsg("sys", "Screen sharing was cancelled."); return;
+    }
+    video.srcObject = screenStream;
+    await video.play().catch(() => {});
+    screenStream.getVideoTracks()[0].addEventListener("ended", stopScreen);
+    sharing = true; guideHistory = []; goalActive = false; lastThumb = null;
+    document.body.classList.add("sharing", "compact");
+    $("screenLabel").textContent = "STOP SHARING";
+    api("/api/window", { mode: "compact" }).catch(() => {});
+    addMsg("sys", "Screen sharing ON — I can see your screen.");
+    watchTimer = setInterval(watch, 4000);
+    const hi = isFa() ? "صفحه‌ات را می‌بینم. بگو چه کاری می‌خواهی انجام بدهی؟" : "I can see your screen. Tell me what you want to do.";
+    $("heard").textContent = hi;
+    await speak(hi);
+    setState("idle");
+  }
+
+  function stopScreen() {
+    if (!sharing) return;
+    sharing = false; goalActive = false;
+    clearInterval(watchTimer);
+    if (screenStream) screenStream.getTracks().forEach((t) => t.stop());
+    screenStream = null;
+    document.body.classList.remove("sharing", "compact");
+    $("screenLabel").textContent = "SHARE SCREEN · GUIDE ME";
+    api("/api/window", { mode: "normal" }).catch(() => {});
+    addMsg("sys", "Screen sharing OFF.");
+  }
+
+  const shot = document.createElement("canvas");
+  const tiny = document.createElement("canvas");
+  tiny.width = 48; tiny.height = 27;
+  function grab() {
+    const w = video.videoWidth, h = video.videoHeight;
+    if (!w || !h) return null;
+    const scale = Math.min(1, 1280 / w);
+    shot.width = Math.round(w * scale); shot.height = Math.round(h * scale);
+    shot.getContext("2d").drawImage(video, 0, 0, shot.width, shot.height);
+    const t = tiny.getContext("2d", { willReadFrequently: true });
+    t.drawImage(video, 0, 0, tiny.width, tiny.height);
+    const px = t.getImageData(0, 0, tiny.width, tiny.height).data;
+    const gray = new Uint8Array(tiny.width * tiny.height);
+    for (let i = 0; i < gray.length; i++) gray[i] = (px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2]) / 3;
+    return { url: shot.toDataURL("image/jpeg", 0.6), gray };
+  }
+  function changed(a, b) {
+    if (!a || !b) return 99;
+    let d = 0;
+    for (let i = 0; i < a.length; i++) d += Math.abs(a[i] - b[i]);
+    return d / a.length;
+  }
+
+  async function guideTurn(text, auto = false) {
+    if (busy) return;
+    const frame = grab();
+    if (!frame) return;
+    busy = true;
+    if (!auto) { addMsg("user", text); $("heard").textContent = text; goalActive = true; setState("thinking"); }
+    lastAskAt = Date.now(); lastThumb = frame.gray;
+    const userText = auto ? "[auto-check] Screen updated. Check progress on the current step." : text;
+    const messages = [{ role: "system", content: guideCfg.system }, ...guideHistory.slice(-12), {
+      role: "user",
+      content: [{ type: "text", text: userText }, { type: "image_url", image_url: { url: frame.url } }],
+    }];
+    try {
+      const out = await askVision(messages, auto);
+      if (out === null) return;
+      let say = "", done = false;
+      try {
+        const m = out.replace(/```(?:json)?/g, "").match(/\{[\s\S]*\}/);
+        const obj = JSON.parse(m ? m[0] : out);
+        say = String(obj.say || "").trim(); done = !!obj.goal_done;
+      } catch (e) { say = auto ? "" : out.trim(); }
+      if (!auto || say) guideHistory.push({ role: "user", content: userText });
+      if (say) {
+        guideHistory.push({ role: "assistant", content: say });
+        addMsg("bot", say); $("heard").textContent = say;
+        await speak(say);
+      }
+      if (done) goalActive = false;
+    } finally {
+      busy = false;
+      setState("idle");
+      if (live) setTimeout(startListening, 400);
+    }
+  }
+
+  async function askVision(messages, quiet) {
+    const models = [guideCfg.model, ...(guideCfg.backup || [])];
+    for (let i = 0; i < models.length; i++) {
+      const last = i === models.length - 1;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), last ? 40000 : 20000);
+      try {
+        const r = await fetch(guideCfg.url, {
+          method: "POST", signal: ctrl.signal,
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + guideCfg.key },
+          body: JSON.stringify({ model: models[i], messages, temperature: 0.3 }),
+        });
+        let data = null;
+        try { data = await r.json(); } catch (e) {}
+        if (Array.isArray(data)) data = data[0];
+        if (r.ok) return (data && data.choices && data.choices[0].message.content) || "";
+        if (r.status === 429) pausedUntil = Date.now() + 30000;
+        if (!last && [404, 429, 500, 503].includes(r.status)) continue;
+        if (!quiet) addMsg("bot", "The AI service had a problem (" + r.status + "). Please try again.");
+        return null;
+      } catch (e) {
+        if (!last) continue;
+        if (!quiet) addMsg("bot", "I can't reach the AI service right now.");
+        return null;
+      } finally { clearTimeout(timer); }
+    }
+    return null;
+  }
+
+  // Every few seconds: if the screen changed and then settled, check the progress.
+  let pendingChange = false;
+  function watch() {
+    if (!sharing || !goalActive || busy || state === "speaking" || recognizing || Date.now() < pausedUntil) return;
+    const frame = grab();
+    if (!frame) return;
+    const diff = changed(frame.gray, lastThumb);
+    if (diff > 4) { pendingChange = true; lastChangeAt = Date.now(); lastThumb = frame.gray; return; }
+    const settled = pendingChange && Date.now() - lastChangeAt > 1500;
+    const stuck = Date.now() - lastAskAt > 45000;
+    if (settled || stuck) { pendingChange = false; guideTurn("", true); }
+  }
+
+  $("screenBtn").addEventListener("click", () => (sharing ? stopScreen() : startScreen()));
+  $("cform").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const v = $("cinput").value; $("cinput").value = "";
+    sendCommand(v);
   });
 
   // ------------------------------------------------------------ updates
