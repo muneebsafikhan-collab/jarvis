@@ -206,15 +206,19 @@ details summary { color: var(--muted); font-size: 13px; }
       "and tell them the ONE next step to do (what to tap or type and where it is). The user does every tap themselves. " +
       "If they did the previous step correctly, praise them briefly first. " +
       "If opening a website or app link would help (YouTube, Google search, maps...), add a link. " +
-      'Reply with ONLY a JSON object: {"say": "text to say", "link": {"label": "short button text", "url": "https://..."} } ' +
-      "(omit link if not needed).";
+      "If the user sends a VOICE recording, understand it and answer it, and put the exact words they said in \"heard\". " +
+      'Reply with ONLY a JSON object: {"say": "text to say", "heard": "only for voice messages", "link": {"label": "short button text", "url": "https://..."} } ' +
+      "(omit link and heard if not needed).";
   }
 
   const history = [];
-  async function chat(text, image) {
-    const userContent = image
-      ? [{ type: "text", text }, { type: "image_url", image_url: { url: image } }]
-      : text;
+  async function chat(text, image, audio) {
+    let userContent = text;
+    if (image || audio) {
+      userContent = [{ type: "text", text }];
+      if (image) userContent.push({ type: "image_url", image_url: { url: image } });
+      if (audio) userContent.push({ type: "input_audio", input_audio: { data: audio, format: "wav" } });
+    }
     const messages = [{ role: "system", content: systemPrompt() }, ...history.slice(-12), { role: "user", content: userContent }];
     const models = [...new Set([cfg.model || CHAT_MODELS[0], ...CHAT_MODELS])];
     let lastErr = "";
@@ -230,9 +234,10 @@ details summary { color: var(--muted); font-size: 13px; }
         let data = null; try { data = await r.json(); } catch (e) {}
         if (Array.isArray(data)) data = data[0];
         if (r.ok) {
-          history.push({ role: "user", content: image ? text + " [screenshot]" : text });
           const content = (data && data.choices && data.choices[0].message.content) || "";
-          return parse(content);
+          const res = parse(content);
+          history.push({ role: "user", content: (audio ? (res.heard || "[voice message]") : text) + (image ? " [screenshot]" : "") });
+          return res;
         }
         const detail = (data && data.error && data.error.message) || "";
         if (r.status === 400 && /api key/i.test(detail)) throw new Error("KEY");
@@ -252,10 +257,10 @@ details summary { color: var(--muted); font-size: 13px; }
       try {
         const o = JSON.parse(m[0]);
         const link = o.link && typeof o.link.url === "string" && /^https:\/\//.test(o.link.url) ? o.link : null;
-        return { say: String(o.say || "").trim(), link };
+        return { say: String(o.say || "").trim(), heard: String(o.heard || "").trim(), link };
       } catch (e) {}
     }
-    return { say: c, link: null };
+    return { say: c, heard: "", link: null };
   }
 
   // ---------------------------------------------------------- voice out
@@ -370,19 +375,24 @@ details summary { color: var(--muted); font-size: 13px; }
   }
 
   // ---------------------------------------------------------- send
-  async function send(text) {
+  async function send(text, audio) {
     text = (text || "").trim();
     const image = pendingImage;
-    if ((!text && !image) || busy) return;
+    if ((!text && !image && !audio) || busy) return;
     if (!cfg.key) { openSheet(); toast(fa() ? "اول کلید را در تنظیمات بگذار." : "Add your API key first."); return; }
+    if (audio) text = image ? "(voice message about this screenshot)" : "(voice message)";
     if (!text) text = fa() ? "این صفحه‌ی من است. قدم بعدی چیست؟" : "This is my screen. What should I do next?";
     busy = true;
     pendingImage = null; $("attach").classList.remove("on");
-    addMsg("user", text, image);
-    $("heard").textContent = text;
+    const bubble = addMsg("user", audio ? "🎙 …" : text, image);
+    $("heard").textContent = audio ? "🎙 …" : text;
     setState("thinking");
     try {
-      const res = await chat(text, image);
+      const res = await chat(text, image, audio);
+      if (audio && res.heard) {
+        const tn = [...bubble.childNodes].find((n) => n.nodeType === 3);
+        if (tn) tn.textContent = "🎙 " + res.heard;
+      }
       history.push({ role: "assistant", content: res.say });
       while (history.length > 24) history.shift();
       const el = addMsg("bot", res.say);
@@ -412,17 +422,79 @@ details summary { color: var(--muted); font-size: 13px; }
     send(v);
   });
 
-  // ---------------------------------------------------------- voice in
+  // ---------------------------------------------------------- voice in (recording, works without Siri dictation)
+  let srBroken = false;
+  try { srBroken = localStorage.getItem("jarvis_sr_broken") === "1"; } catch (e) {}
+  let recStream = null, recNode = null, recSrc = null, chunks = [], recording = false, recStart = 0, lastLoud = 0, recTimer = null;
+  async function startRecording() {
+    unlockAudio();
+    try {
+      recStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    } catch (e) {
+      toast(fa() ? "اجازه‌ی میکروفون نیست. در تنظیمات آیفون: Apps ← Safari ← Microphone ← Allow" : "Microphone blocked. iPhone Settings → Apps → Safari → Microphone → Allow", 7000);
+      return;
+    }
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await audioCtx.resume().catch(() => {});
+    recSrc = audioCtx.createMediaStreamSource(recStream);
+    recNode = audioCtx.createScriptProcessor(4096, 1, 1);
+    chunks = []; recording = true; recStart = lastLoud = Date.now();
+    recNode.onaudioprocess = (ev) => {
+      if (!recording) return;
+      const d = ev.inputBuffer.getChannelData(0);
+      chunks.push(new Float32Array(d));
+      let sum = 0; for (let i = 0; i < d.length; i += 4) sum += d[i] * d[i];
+      const rms = Math.sqrt(sum / (d.length / 4));
+      level = Math.min(1, rms * 8);
+      if (rms > 0.02) lastLoud = Date.now();
+    };
+    recSrc.connect(recNode); recNode.connect(audioCtx.destination);
+    setState("listening");
+    $("heard").textContent = fa() ? "گوش می‌دهم… حرفت تمام شد، دوباره دکمه را بزن." : "Listening… tap again when you finish.";
+    recTimer = setInterval(() => {
+      const t = Date.now();
+      if (t - recStart > 30000 || (t - recStart > 2500 && t - lastLoud > 1800)) stopRecording();
+    }, 250);
+  }
+  function stopRecording() {
+    if (!recording) return;
+    recording = false; clearInterval(recTimer);
+    try { recSrc.disconnect(); recNode.disconnect(); } catch (e) {}
+    recStream.getTracks().forEach((t) => t.stop());
+    setState("idle");
+    const rate = audioCtx.sampleRate;
+    const total = chunks.reduce((n, c) => n + c.length, 0);
+    if (total < rate * 0.5) { $("heard").textContent = ""; return; }
+    send("", toWav(chunks, total, rate));
+  }
+  function toWav(parts, total, rate) {
+    const target = 16000, ratio = rate / target, n = Math.floor(total / ratio);
+    const all = new Float32Array(total); let off = 0;
+    for (const c of parts) { all.set(c, off); off += c.length; }
+    const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+    w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, target, true); v.setUint32(28, target * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, "data"); v.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) {
+      const x = Math.max(-1, Math.min(1, all[Math.floor(i * ratio)]));
+      v.setInt16(44 + i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+    }
+    let bin = ""; const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  }
+
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   let rec = null, recognizing = false;
   $("micBtn").addEventListener("click", () => {
     unlockAudio();
     if (state === "speaking") { try { speechSynthesis.cancel(); } catch (e) {} return; }
-    if (!SR) {
-      toast(fa() ? "روی این گوشی از میکروفونِ کیبورد استفاده کن: در خانه‌ی نوشتن بزن و دکمه‌ی میکروفون کیبورد را بزن." : "Use the microphone key on your keyboard to dictate.", 6000);
-      $("input").focus();
-      return;
-    }
+    if (recording) { stopRecording(); return; }
+    if (busy) return;
+    if (!cfg.key) { openSheet(); return; }
+    if (!SR || srBroken) { startRecording(); return; }
     if (recognizing) { rec.stop(); return; }
     rec = new SR();
     rec.lang = cfg.lang; rec.interimResults = true; rec.continuous = false;
@@ -436,8 +508,12 @@ details summary { color: var(--muted); font-size: 13px; }
       $("heard").textContent = finalText || interim;
     };
     rec.onerror = (ev) => {
-      if (ev.error === "not-allowed" || ev.error === "service-not-allowed")
-        toast(fa() ? "اجازه‌ی میکروفون داده نشد. از میکروفونِ کیبورد استفاده کن." : "Microphone not allowed. Use the keyboard microphone instead.", 6000);
+      if (ev.error === "not-allowed" || ev.error === "service-not-allowed" || ev.error === "audio-capture") {
+        srBroken = true;
+        try { localStorage.setItem("jarvis_sr_broken", "1"); } catch (e) {}
+        finalText = "";
+        setTimeout(startRecording, 200);
+      }
     };
     rec.onend = () => {
       recognizing = false;
